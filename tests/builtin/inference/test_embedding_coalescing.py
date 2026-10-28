@@ -194,6 +194,35 @@ def test_cache_hits_report_no_requests_and_keep_provider_tokens() -> None:
     _run(scenario)
 
 
+def test_one_call_sums_the_usage_of_every_batch_it_waited_for() -> None:
+    base = RecordingEmbedding()
+    model = CoalescingEmbeddingModel(base, max_batch_size=4, coalesce_ms=0, cache_size=0)
+    texts = tuple(f"text-{index}" for index in range(9))
+
+    async def scenario() -> None:
+        result = await model.embed(texts)
+        assert result.vectors == tuple(_vector(text) for text in texts)
+        assert len(base.calls) == 3, "nine distinct texts at four per batch need three requests"
+        assert result.usage.requests == 3, "each distinct batch is charged exactly once"
+        assert result.usage.input_tokens == 3 * len(texts), "provider tokens are preserved, not recomputed"
+
+    _run(scenario)
+
+
+def test_a_partially_cached_call_only_charges_the_missing_batches() -> None:
+    base = RecordingEmbedding()
+    model = CoalescingEmbeddingModel(base, max_batch_size=8, coalesce_ms=0)
+
+    async def scenario() -> None:
+        await model.embed(("alpha", "beta"))
+        result = await model.embed(("alpha", "beta", "gamma"))
+        assert result.vectors == (_vector("alpha"), _vector("beta"), _vector("gamma"))
+        assert base.calls == [("alpha", "beta"), ("gamma",)]
+        assert result.usage.requests == 1, "cached texts must not be charged again"
+
+    _run(scenario)
+
+
 def test_a_failed_batch_is_not_cached_and_can_be_retried() -> None:
     class Flaky(RecordingEmbedding):
         async def embed(self, texts: Sequence[str], /) -> EmbeddingResult:
