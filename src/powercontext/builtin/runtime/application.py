@@ -166,6 +166,12 @@ from powercontext.builtin.runtime._scope_cache import (
     ScopeCacheObserver,
     ScopeEvictor,
 )
+from powercontext.builtin.runtime.context_pack import (
+    DEFAULT_CHUNK_BYTES,
+    ContextPack,
+    ContextPackDelta,
+    ContextPackError,
+)
 from powercontext.builtin.runtime.decision_model import DecisionModel
 from powercontext.builtin.runtime.errors import InvalidRuntimeRequestError, TopicMemoryProcessingUnavailableError
 from powercontext.builtin.runtime.models import (
@@ -846,6 +852,31 @@ class ScopedContextApplication:
             if authorize_scopes is not None:
                 await authorize_scopes((self.scope_id, *scope.context_references))
             return await self._prepare(request, scope)
+
+    async def prepare_incremental(
+        self,
+        request: PrepareContextRequest,
+        /,
+        base_pack: ContextPack | None = None,
+        *,
+        chunk_bytes: int = DEFAULT_CHUNK_BYTES,
+    ) -> ContextPack | ContextPackDelta:
+        """Prepare this turn's context as a Context Pack, or as a delta against a base pack.
+
+        Without a base pack the caller gets the complete pack. With one, the caller gets a
+        delta carrying only the target suffix, so a client holding the base pack can rebuild
+        this turn's body from serialized bytes alone. The body itself is exactly what
+        :meth:`prepare` returns for the same request; this operation only changes its
+        transport form.
+        """
+
+        if base_pack is not None and not isinstance(base_pack, ContextPack):
+            raise ContextPackError("base-pack-not-a-context-pack")
+        prepared = await self.prepare(request)
+        pack = ContextPack.from_content(prepared.content or "", chunk_bytes=chunk_bytes)
+        if base_pack is None:
+            return pack
+        return ContextPackDelta.between(base_pack, pack)
 
     async def _prepare(self, request: PrepareContextRequest, scope: ScopeDescriptor, /) -> PreparedContext:
         build, effort = await self._prepare_build(request, scope)
