@@ -34,3 +34,7 @@ MAX_EXTERNAL_SKILL_DESCRIPTION_LENGTH = 2_000
 MAX_EXTERNAL_SKILL_HOST_ID_LENGTH = 128
 MAX_EXTERNAL_SKILL_LOCATOR_LENGTH = 2_000
 MAX_POLICY_REVISION_LENGTH = 64
+# Source lifecycle node identity: an opaque caller-chosen label, not a Source or
+# Artifact identity, so it only has to stay inside a utf8mb4 index key.
+MAX_LIFECYCLE_NODE_ID_LENGTH = 128
+MAX_LIFECYCLE_REASON_LENGTH = 512

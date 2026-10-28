@@ -143,6 +143,7 @@ from powercontext.builtin.persistence.handoff import (
     RelationalHandoffBackend,
     RelationalHandoffEvidenceResolver,
 )
+from powercontext.builtin.persistence.lifecycle import LifecycleLedgerRepository
 from powercontext.builtin.persistence.memory import RelationalMemoryBackend
 from powercontext.builtin.persistence.memory_index import MemoryIndex, NoMemoryIndex
 from powercontext.builtin.persistence.processing import ArtifactProcessingPendingRepository
@@ -173,6 +174,7 @@ from powercontext.builtin.review.models import ArtifactCandidate
 from powercontext.builtin.review.service import ReviewService
 from powercontext.builtin.runtime._model_usage import _ModelUsageRecorder
 from powercontext.builtin.runtime.decision_model import DecisionModel
+from powercontext.builtin.runtime.lifecycle_backend import RelationalLifecycleBackend
 from powercontext.builtin.runtime.models import (
     CommitConnectorCheckpoint,
     ConnectorCheckpointState,
@@ -711,6 +713,40 @@ class RelationalContexts:
         self._activation_locks: dict[str, asyncio.Lock] = {}
         self._experience_locks: dict[str, asyncio.Lock] = {}
         self._skill_publication_locks: dict[tuple[str, str, str], asyncio.Lock] = {}
+
+    def lifecycle_backend(self, scope_id: str, /) -> RelationalLifecycleBackend:
+        """Return the Source lifecycle ledger and native writers for one Scope."""
+
+        scope = validate_scope_id(scope_id)
+        services = self._services_for(scope)
+        _sources_backend, source_catalog = services.sources()
+
+        async def source_exists(current: str, ref: SourceRef) -> bool:
+            try:
+                async with self.database.transaction() as connection:
+                    await self.repositories.sources.get(connection, current, ref)
+            except RepositoryNotFoundError:
+                return False
+            return True
+
+        async def topic_exists(current: str, reference: ArtifactRef) -> bool:
+            try:
+                async with self.database.transaction() as connection:
+                    await self.repositories.topic_memories.get_exact(connection, current, reference)
+            except (RepositoryNotFoundError, ArtifactNotFoundError):
+                return False
+            return True
+
+        async def memory_context(current: str) -> tuple[MemoryService, str]:
+            return self._services_for(current).memory(source_catalog), self._memory_artifact_id
+
+        return RelationalLifecycleBackend(
+            database=self.database,
+            ledger=LifecycleLedgerRepository(),
+            memory_context=memory_context,
+            source_exists=source_exists,
+            topic_exists=topic_exists,
+        )
 
     @property
     def token_estimator(self) -> TokenEstimator:
