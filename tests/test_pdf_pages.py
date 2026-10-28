@@ -359,6 +359,71 @@ def test_search_uses_feedback_wording_absent_from_the_question() -> None:
     assert memory.page_for(citations[0]) == ("doc", 2)
 
 
+def test_search_scopes_to_named_filing_when_multiple_documents_share_memory() -> None:
+    amd_pages = _parse(
+        "AMD_2022_10K",
+        _text_pdf([
+            "Consolidated Balance Sheets Current assets Cash and cash equivalents 1,000 2,000",
+        ]),
+    )
+    boeing_pages = _parse(
+        "BOEING_2022_10K",
+        _text_pdf([
+            "Consolidated Balance Sheets Current assets Cash and cash equivalents 10,000 20,000 30,000 40,000",
+            "Liquidity profile quick ratio current assets 50,000 60,000 70,000 80,000",
+        ]),
+    )
+    memory = _StubMemory((*amd_pages, *boeing_pages))
+    citations = asyncio.run(
+        search_pdf_pages(
+            memory,
+            "Does AMD have a reasonably healthy liquidity profile based on its quick ratio for FY22?",
+            limit=5,
+        )
+    )
+    assert [memory.page_for(citation) for citation in citations] == [("AMD_2022_10K", 1)]
+
+
+def test_search_handles_compound_and_shorthand_entity_names_across_filings() -> None:
+    amex_pages = _parse(
+        "AMERICANEXPRESS_2022_10K",
+        _text_pdf(["Operating margin and net revenue for card member services"]),
+    )
+    jnj_pages = _parse(
+        "JOHNSON_JOHNSON_2022_10K",
+        _text_pdf(["Cost of products sold and gross margin analysis"]),
+    )
+    memory = _StubMemory((*amex_pages, *jnj_pages))
+    amex_hits = asyncio.run(
+        search_pdf_pages(memory, "Does AMEX have an improving operating margin profile as of 2022?", limit=5)
+    )
+    jnj_hits = asyncio.run(
+        search_pdf_pages(memory, "What drove gross margin change as of FY2022 for JnJ?", limit=5)
+    )
+    assert [memory.page_for(citation) for citation in amex_hits] == [("AMERICANEXPRESS_2022_10K", 1)]
+    assert [memory.page_for(citation) for citation in jnj_hits] == [("JOHNSON_JOHNSON_2022_10K", 1)]
+
+
+def test_search_preserves_statement_names_inside_answering_instructions() -> None:
+    pages = _parse(
+        "doc",
+        _text_pdf([
+            "General corporate commentary about retail operations.",
+            "Consolidated Statements of Operations Total net sales 177,866 135,987 107,006",
+        ]),
+    )
+    memory = _StubMemory(pages)
+    citations = asyncio.run(
+        search_pdf_pages(
+            memory,
+            "What is the year-over-year change? Calculate what was asked by utilizing "
+            "the line items clearly shown in the statement of operations.",
+            limit=1,
+        )
+    )
+    assert [memory.page_for(citation) for citation in citations] == [("doc", 2)]
+
+
 class _StubMemory:
     """Minimal scoped Memory surface used by the ranking tests."""
 
@@ -370,7 +435,7 @@ class _StubMemory:
         for page in pages:
             source_id = pdf_page_source_id(page.document_id, digest, page.page_number)
             entry = _StubEntry(
-                entry_id=f"entry-{page.page_number}",
+                entry_id=f"entry-{page.document_id}-{page.page_number}",
                 text=f"{page.document_id}\n{page.text}".strip(),
                 source_type="pdf-page",
                 source_id=source_id,
