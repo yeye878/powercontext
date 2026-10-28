@@ -499,6 +499,7 @@ class ScopedSourceApplication:
                             span.set_attributes({_MEMORY_CAPTURE_SOURCE_COUNT: 1})
             except BaseValueConflictError as error:
                 raise SourceConflictError("identity", error.identity) from None
+            self._runtime._wake_count_admission()
             return SourceReceipt(
                 source_ref=SourceRef(source_type=record.source_type, source_id=record.source_id),
                 sequence=record.position,
@@ -515,6 +516,7 @@ class ScopedSourceApplication:
                 )
                 if span is not None:
                     span.set_attributes({_MEMORY_CAPTURE_SOURCE_COUNT: 1})
+            self._runtime._wake_count_admission()
             return SourceReceipt(source_ref=context.sources.catalog.as_ref(source), sequence=sequence)
 
 
@@ -574,7 +576,11 @@ class ScopedRecordApplication:
         /,
     ) -> ArtifactCreated:
         async with self._runtime._scope_operation(self.scope_id), self._runtime._locked(self.scope_id):
-            return await self._runtime._records().create_artifact(self.scope_id, family, write)
+            created = await self._runtime._records().create_artifact(self.scope_id, family, write)
+        # Create also appends a lineage-only journal identity, which counts toward
+        # a Family threshold even though it never becomes generation evidence.
+        self._runtime._wake_count_admission()
+        return created
 
     async def get_artifact(self, family: str, artifact_id: str, /) -> ArtifactRecord:
         async with self._runtime._scope_operation(self.scope_id):
@@ -3465,6 +3471,28 @@ class BuiltinRuntime:
             with self._stage("scope.context", attributes={}):
                 context = await self._provider.get(validate_scope_id(scope_id))
             yield context
+
+    def _wake_count_admission(self) -> None:
+        """Nudge count-triggered admission after a committed journal append.
+
+        Only a new journal identity can reach a count threshold, so this is the
+        narrowest place to shorten the latency: the Supervisor still re-reads the
+        persisted Cursor and head before it accepts anything.
+        """
+
+        supervisor = self.artifact_processing_supervisor
+        if supervisor is None:
+            return
+        try:
+            supervisor.wake()
+        except Exception as error:
+            log_safely(
+                logger,
+                logging.WARNING,
+                "Artifact processing wake failed after a Source journal append",
+                exc_info=error,
+                extra={"event": "artifact_processing.wake_failed"},
+            )
 
     def _lock(self, scope_id: str) -> asyncio.Lock:
         return self._scope_cache.lock(validate_scope_id(scope_id))
