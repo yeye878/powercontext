@@ -843,11 +843,17 @@ class ScopedContextApplication:
     ) -> PreparedContext:
         if (
             request.assembly is not None
+            and not request.evidence_selection
             and sum(section.limit for section in request.assembly.sections) > self._runtime.context_assembly_max_entries
         ):
             raise InvalidRuntimeRequestError("context-assembly-entry-limit")
         async with self._runtime._scope_operation(self.scope_id) as scope:
-            if request.assembly is not None and not request.assembly.sections and not request.include_code:
+            if (
+                request.assembly is not None
+                and not request.assembly.sections
+                and not request.include_code
+                and not request.evidence_selection
+            ):
                 return PreparedContextBuilder().empty()
             if authorize_scopes is not None:
                 await authorize_scopes((self.scope_id, *scope.context_references))
@@ -939,10 +945,16 @@ class ScopedContextApplication:
         if request.include_code:
             builder.entry_limit = self._runtime.context_assembly_max_entries
         scope_ids = [self.scope_id, *scope.context_references]
+        # Evidence selection is Memory-only: it neither reads nor renders the other families,
+        # so their recall is skipped rather than paid for and discarded.
         families: set[str] = (
-            {section.family for section in request.assembly.sections}
-            if request.assembly is not None
-            else {MEMORY_FAMILY, EXPERIENCE_FAMILY, TOPIC_MEMORY_FAMILY}
+            {MEMORY_FAMILY}
+            if request.evidence_selection
+            else (
+                {section.family for section in request.assembly.sections}
+                if request.assembly is not None
+                else {MEMORY_FAMILY, EXPERIENCE_FAMILY, TOPIC_MEMORY_FAMILY}
+            )
         )
         # Caller-owned cache of the query vectors round 0 already paid for, keyed by scope.
         # Expansion rounds read it so a repeat search does not re-embed; round 0 fills it.
