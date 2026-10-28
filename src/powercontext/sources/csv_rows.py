@@ -69,8 +69,12 @@ class CSVRowSource(Source):
     values: tuple[str, ...]
 
 
-def parse_csv_document(value: CSVDocumentInput, /) -> tuple[CSVRowInput, ...]:
-    """Parse and fully validate one CSV document without returning partial rows."""
+def parse_csv_document(value: CSVDocumentInput) -> tuple[CSVRowInput, ...]:
+    """Parse and fully validate one CSV document without returning partial rows.
+
+    Every row is validated, including its encoded Source identity, before any
+    row is returned, so a document that cannot be materialized fails whole.
+    """
 
     _require_document_id(value.document_id)
     _require_primary_key(value.primary_key)
@@ -101,6 +105,9 @@ def parse_csv_document(value: CSVDocumentInput, /) -> tuple[CSVRowInput, ...]:
             raise ValueError("CSV primary key value must not be blank")  # noqa: TRY003
         if primary_key_value in key_values:
             raise ValueError(f"duplicate CSV primary key value {primary_key_value!r}")  # noqa: TRY003
+        # Validate the identity now so an unrepresentable row fails this document
+        # instead of surfacing later during materialization.
+        csv_row_source_id(value.document_id, primary_key_value)
         key_values.add(primary_key_value)
         rows.append(
             CSVRowInput(
@@ -114,7 +121,7 @@ def parse_csv_document(value: CSVDocumentInput, /) -> tuple[CSVRowInput, ...]:
     return tuple(rows)
 
 
-def csv_row_source_id(document_id: str, primary_key_value: str, /) -> str:
+def csv_row_source_id(document_id: str, primary_key_value: str) -> str:
     """Return the stable, delimiter-safe identity of one captured row."""
 
     _require_document_id(document_id)
@@ -136,6 +143,7 @@ class CSVRowSourceAdapter:
 
     async def resolve(self, value: CSVRowInput, /) -> CSVRowSource:
         source_id = csv_row_source_id(value.document_id, value.primary_key_value)
+        _require_row_shape(value)
         return CSVRowSource(
             name=source_id,
             materialization=SourceMaterialization.CAPTURED,
@@ -240,6 +248,27 @@ def _require_primary_key(primary_key: str) -> None:
 def _require_primary_key_value(primary_key_value: str) -> None:
     if not primary_key_value.strip():
         raise ValueError("CSV primary key value must not be blank")  # noqa: TRY003
+
+
+def _require_row_shape(value: CSVRowInput) -> None:
+    """Reject a hand-built row whose declared identity disagrees with its fields."""
+
+    columns = list(value.columns)
+    _require_header(columns)
+    if len(value.columns) != len(value.values):
+        raise ValueError(  # noqa: TRY003
+            f"CSV row has {len(value.values)} values, expected {len(value.columns)}"
+        )
+    try:
+        key_index = columns.index(value.primary_key)
+    except ValueError:
+        raise ValueError(  # noqa: TRY003
+            f"CSV row columns do not contain the primary key {value.primary_key!r}"
+        ) from None
+    if value.values[key_index] != value.primary_key_value:
+        raise ValueError(  # noqa: TRY003
+            "CSV row primary_key_value does not match its primary key column"
+        )
 
 
 __all__ = [

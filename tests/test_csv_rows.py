@@ -31,6 +31,7 @@ from powercontext.sources import (
 from powercontext.sources.csv_rows import (
     CSV_ROW_SOURCE_DEFINITION,
     CSVDocumentInput,
+    CSVRowInput,
     CSVRowSource,
     csv_row_source_id,
     parse_csv_document,
@@ -158,6 +159,64 @@ def test_source_id_limit_is_enforced_after_encoding() -> None:
         csv_row_source_id(" doc ", "key")
     with pytest.raises(ValueError):
         csv_row_source_id("doc", "   ")
+
+
+def test_public_entry_points_accept_keyword_arguments() -> None:
+    rows = parse_csv_document(value=CSVDocumentInput(document_id="doc", primary_key="id", content=b"id,name\n1,one\n"))
+    assert rows[0].values == ("1", "one")
+    assert csv_row_source_id(document_id="doc", primary_key_value="1") == "csv:doc:1"
+
+
+def test_parse_rejects_rows_whose_identity_would_exceed_the_limit() -> None:
+    content = b"id,name\n" + b"x" * 260 + b",one\n"
+    with pytest.raises(ValueError):
+        _parse("doc", "id", content)
+
+
+def test_parse_rejects_identity_expansion_by_percent_encoding() -> None:
+    # 30 raw characters encode to 270, so the identity would be 276 characters.
+    content = ("id,name\n" + "文" * 30 + ",one\n").encode()
+    with pytest.raises(ValueError):
+        _parse("doc", "id", content)
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        CSVRowInput(
+            document_id="doc",
+            primary_key="id",
+            primary_key_value="1",
+            columns=("id", "name"),
+            values=("1",),
+        ),
+        CSVRowInput(
+            document_id="doc",
+            primary_key="id",
+            primary_key_value="1",
+            columns=("name", "note"),
+            values=("one", "n"),
+        ),
+        CSVRowInput(
+            document_id="doc",
+            primary_key="id",
+            primary_key_value="2",
+            columns=("id", "name"),
+            values=("1", "one"),
+        ),
+        CSVRowInput(
+            document_id="doc",
+            primary_key="id",
+            primary_key_value="1",
+            columns=("id", "id"),
+            values=("1", "1"),
+        ),
+    ],
+)
+def test_resolve_rejects_hand_built_rows_with_inconsistent_shape(row: CSVRowInput) -> None:
+    registry = SourceDefinitionRegistry((CSV_ROW_SOURCE_DEFINITION,))
+    with pytest.raises(ValueError):
+        asyncio.run(registry.resolve(row))
 
 
 def test_definition_materializes_captured_rows_and_reads_input_back() -> None:
