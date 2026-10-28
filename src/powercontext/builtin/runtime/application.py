@@ -248,6 +248,10 @@ from powercontext.builtin.runtime.recall_sufficiency import (
     build_recall_candidates,
     recall_effort,
 )
+from powercontext.builtin.runtime.source_lifecycle import (
+    LifecycleBackendFactory,
+    SourceLifecycleApplication,
+)
 from powercontext.builtin.runtime.statistics import RelationalScopedStatistics, overview_selection
 from powercontext.builtin.scope import ScopeApplication, ScopeDescriptor, ScopeSelection
 from powercontext.builtin.scope.subject_sources import SubjectSourceService
@@ -457,6 +461,7 @@ class _RuntimeStateError(RuntimeError):
             "skill-usage": "Managed Skill usage recording is not configured",
             "statistics": "Statistics services are not configured",
             "topic-memory-browse": "Topic Memory browsing is not configured",
+            "lifecycle": "Source lifecycle services are not configured",
         }
         super().__init__(messages[code])
 
@@ -1435,6 +1440,20 @@ class ScopedContextApplication:
             generation_calls=memory_generation_calls,
         )
 
+    async def _hide_withdrawn_topics(self, result: TopicMemorySearchResult, /) -> tuple[TopicMemorySearchHit, ...]:
+        """Drop Topic hits whose registered lifecycle evidence was withdrawn.
+
+        A Scope that never registered lifecycle evidence yields an empty filter
+        set, which keeps the ordinary native recall path unchanged.
+        """
+
+        if not result.hits:
+            return ()
+        withdrawn = await self._runtime.lifecycle.unavailable_topics(self.scope_id)
+        if not withdrawn:
+            return result.hits
+        return tuple(hit for hit in result.hits if hit.artifact_ref.artifact_id not in withdrawn)
+
     async def _topic_memory_hits(
         self,
         query: str,
@@ -1469,7 +1488,7 @@ class ScopedContextApplication:
             if span is not None:
                 span.set_attributes({"powercontext.topic_memory.search.result_count": len(result.hits)})
             return TopicMemoryRecallOutcome(
-                hits=result.hits,
+                hits=await self._hide_withdrawn_topics(result),
                 admission=result.admission,
                 query_embedding=result.query_embedding,
                 embedding_calls=result.embedding_calls,
@@ -2667,6 +2686,7 @@ class ScopedTopicMemoryApplication:
                     query_embedding,
                     embedding_timeout_seconds,
                 )
+        result = await self._hide_withdrawn_topics(result)
         observer = self._runtime._topic_memory_search_observer
         if observer is not None:
             try:
@@ -2684,6 +2704,23 @@ class ScopedTopicMemoryApplication:
                     },
                 )
         return result
+
+    async def _hide_withdrawn_topics(self, result: TopicMemorySearchResult, /) -> TopicMemorySearchResult:
+        """Drop Topic hits whose registered lifecycle evidence was withdrawn.
+
+        A Scope that never registered lifecycle evidence yields an empty filter
+        set and keeps the native result untouched.
+        """
+
+        if not result.hits:
+            return result
+        withdrawn = await self._runtime.lifecycle.unavailable_topics(self.scope_id)
+        if not withdrawn:
+            return result
+        kept = tuple(hit for hit in result.hits if hit.artifact_ref.artifact_id not in withdrawn)
+        if len(kept) == len(result.hits):
+            return result
+        return result.model_copy(update={"hits": kept})
 
     async def _search_with_embedding(
         self,
@@ -3007,6 +3044,7 @@ class BuiltinRuntime:
         topic_memory_embedding_model: EmbeddingModel | None = None,
         topic_memory_processing_available: bool = False,
         topic_memory_search_observer: TopicMemorySearchObserver | None = None,
+        lifecycle_backend: LifecycleBackendFactory | None = None,
         external_skill_registry: ExternalSkillRegistryFactory | None = None,
         external_skill_importer: ExternalSkillImporter | None = None,
         skill_publication_service: SkillPublicationServiceFactory | None = None,
@@ -3063,6 +3101,7 @@ class BuiltinRuntime:
         self._topic_memory_embedding_model = topic_memory_embedding_model
         self._topic_memory_processing_available = topic_memory_processing_available
         self._topic_memory_search_observer = topic_memory_search_observer
+        self._lifecycle_backend = lifecycle_backend
         self._external_skill_registry = external_skill_registry
         self._external_skill_importer = external_skill_importer
         self._skill_publication_service = skill_publication_service
@@ -3110,6 +3149,11 @@ class BuiltinRuntime:
         self.work = WorkApplication(self)
         self.memory = MemoryApplication(self)
         self.topic_memory = TopicMemoryApplication(self)
+        self.lifecycle = (
+            SourceLifecycleApplication(lifecycle_backend)
+            if lifecycle_backend is not None
+            else SourceLifecycleApplication(_unconfigured_lifecycle_backend)
+        )
         self.records = RecordApplication(self)
         self.prompts = PromptApplication(self)
         self.review = ReviewApplication(self)
@@ -3517,6 +3561,48 @@ def _bounded_topic_memory_recall_query(query: str) -> str:
         selected.append(term[:available])
         characters += separator + min(len(term), available)
     return " ".join(selected)
+
+
+class _UnconfiguredLifecycleBackend:
+    """Fail closed when the Runtime was assembled without a relational backend."""
+
+    async def load(self, scope_id: str, /):
+        raise _RuntimeStateError("lifecycle")
+
+    async def append_node(self, scope_id: str, node: object, /) -> None:
+        raise _RuntimeStateError("lifecycle")
+
+    async def unavailable_topics(self, scope_id: str, /) -> frozenset[str]:
+        return frozenset()
+
+    async def require_source(self, scope_id: str, source_ref: object, /) -> None:
+        raise _RuntimeStateError("lifecycle")
+
+    async def require_memory(self, scope_id: str, citation: object, /) -> None:
+        raise _RuntimeStateError("lifecycle")
+
+    async def require_topic(self, scope_id: str, reference: object, /) -> None:
+        raise _RuntimeStateError("lifecycle")
+
+    async def set_memory_availability(
+        self,
+        scope_id: str,
+        targets: object,
+        /,
+        *,
+        reason: str,
+    ) -> None:
+        raise _RuntimeStateError("lifecycle")
+
+    async def commit_event(self, scope_id: str, event: object, availability: object, /) -> None:
+        raise _RuntimeStateError("lifecycle")
+
+
+_UNCONFIGURED_LIFECYCLE_BACKEND = _UnconfiguredLifecycleBackend()
+
+
+def _unconfigured_lifecycle_backend(scope_id: str, /) -> _UnconfiguredLifecycleBackend:
+    return _UNCONFIGURED_LIFECYCLE_BACKEND
 
 
 async def _head_or_none(service: MemoryService, artifact_id: str) -> Memory | None:

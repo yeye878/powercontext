@@ -634,6 +634,7 @@ async def open_builtin_runtime(
                 topic_memory_embedding_model=configured_embedding,
                 topic_memory_processing_available=topic_memory_processing_available,
                 topic_memory_search_observer=topic_memory_search_observer,
+                lifecycle_backend=contexts.lifecycle_backend,
                 external_skill_registry=contexts.external_skills if contexts.external_skill_registry else None,
                 external_skill_importer=contexts.import_external_skill if contexts.external_skill_registry else None,
                 skill_publication_service=contexts.skill_publications,
