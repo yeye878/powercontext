@@ -141,6 +141,36 @@ class ArtifactProcessingIntentRepository:
             StoredArtifactProcessingIntent, await self.load(connection, scope_id, binding_name, for_update=True)
         )
 
+    async def request_if_idle(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        binding_name: str,
+        /,
+    ) -> StoredArtifactProcessingIntent | None:
+        """Accept one invocation unless an earlier accepted one is outstanding.
+
+        Automatic count admission must be idempotent: the same pending input is
+        observed by every discovery pass until its invocation is acknowledged.
+        Reusing the explicit request counter keeps both admission paths on one
+        durable state machine, so a Scope never has two competing invocations.
+        Returns None when the caller must not admit another invocation.
+        """
+
+        _require_key(scope_id, binding_name)
+        current = await self.load(connection, scope_id, binding_name, for_update=True)
+        if current is None or current.requested_generation > current.handled_generation:
+            return None
+        table = ARTIFACT_PROCESSING_INTENTS_TABLE
+        await connection.execute(
+            update(table)
+            .where(table.c.scope_id == scope_id, table.c.binding_name == binding_name)
+            .values(requested_generation=table.c.requested_generation + 1)
+        )
+        return cast(
+            StoredArtifactProcessingIntent, await self.load(connection, scope_id, binding_name, for_update=True)
+        )
+
     async def acknowledge(
         self,
         connection: AsyncConnection,
