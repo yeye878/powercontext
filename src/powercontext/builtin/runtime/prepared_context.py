@@ -34,6 +34,11 @@ from powercontext.builtin.runtime.prepared_code import (
     PreparedCodeCandidate,
     assemble_code,
 )
+from powercontext.builtin.runtime.prepared_evidence import (
+    EvidenceSpan,
+    evidence_item,
+    select_evidence,
+)
 from powercontext.builtin.runtime.prepared_text import (
     TRUST_POLICY,
     ContextTextItem,
@@ -100,12 +105,18 @@ class PreparedContextBuild:
     **not** a field here: ``ScopedContextApplication._prepare`` returns ``build.context`` and
     discards the rest, so such a field would have no production observer. The trace is
     delivered through the Runtime's optional ``RecallEffortSink`` instead.
+
+    ``fragments`` is filled only by an evidence-selection build. Each fragment is one exact
+    half-open character range of one selected Memory entry, and ``origins[i]`` is the origin
+    that identifies the entry behind ``fragments[i]``; both tuples are empty for the ordinary
+    prepare paths, so a caller that never opts in observes exactly the previous behavior.
     """
 
     context: PreparedContext
     origins: tuple[PreparedContextOrigin, ...]
     omissions: PreparedContextOmissions = PreparedContextOmissions()
     code_origins: tuple[CodeEvidenceRef, ...] = ()
+    fragments: tuple[MemoryFragment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -115,6 +126,21 @@ class MemoryEntryAddress:
     memory: ArtifactAddress
     entry_id: str
     entry_version_id: str
+
+
+@dataclass(frozen=True)
+class MemoryFragment:
+    """One selected literal span of one exact Memory entry version.
+
+    ``start`` and ``end` are half-open Python character coordinates into the entry body, so
+    ``text`` is always exactly ``entry.text[start:end]``. Nothing here is rewritten, translated,
+    summarized, or generated: the span is evidence a caller can re-derive from Memory.
+    """
+
+    address: MemoryEntryAddress
+    start: int
+    end: int
+    text: str
 
 
 PreparedContextOrigin = MemoryCitation | ArtifactRef | MemoryEntryAddress | ArtifactAddress
@@ -155,6 +181,7 @@ class PreparedContextBuilder:
     entry_limit = 8
     topic_memory_entry_limit = 8
     experience_entry_limit = 2
+    evidence_item_limit = 12
     max_entry_content_bytes = 2000
     _text_entry_limit: int | None = None
 
@@ -211,6 +238,20 @@ class PreparedContextBuilder:
         profile_candidates: Sequence[PreparedProfileCandidate] = (),
         code_candidates: Sequence[PreparedCodeCandidate] = (),
     ) -> PreparedContextBuild:
+        if sum(len(candidates.hits) for candidates in memory_candidates) > self.memory_candidate_limit:
+            raise PreparedContextInvariantError("memory-candidate-limit")
+        if len(topic_memory_hits) > self.topic_memory_candidate_limit:
+            raise PreparedContextInvariantError("topic-memory-candidate-limit")
+        if sum(len(candidates.hits) for candidates in experience_candidates) > self.experience_candidate_limit:
+            raise PreparedContextInvariantError("experience-candidate-limit")
+
+        # Evidence selection is a Memory-only mode: it answers one question — which literal
+        # spans of the recalled Memory bodies belong in this turn — so it neither assembles
+        # Code nor the other historical families, and it takes precedence when the caller sets
+        # both flags.
+        if request.evidence_selection:
+            return self._select_evidence(request=request, memory_candidates=memory_candidates)
+
         if request.include_code:
 
             def historical(history_request: PrepareContextRequest, entries: int) -> PreparedContextBuild:
@@ -227,13 +268,6 @@ class PreparedContextBuilder:
                 )
 
             return assemble_code(request, code_candidates, self.entry_limit, historical)
-
-        if sum(len(candidates.hits) for candidates in memory_candidates) > self.memory_candidate_limit:
-            raise PreparedContextInvariantError("memory-candidate-limit")
-        if len(topic_memory_hits) > self.topic_memory_candidate_limit:
-            raise PreparedContextInvariantError("topic-memory-candidate-limit")
-        if sum(len(candidates.hits) for candidates in experience_candidates) > self.experience_candidate_limit:
-            raise PreparedContextInvariantError("experience-candidate-limit")
 
         content, origins, omissions = self._select_entries(
             request=request,
@@ -254,6 +288,82 @@ class PreparedContextBuilder:
             context=PreparedContext(status="ready", content=content, content_bytes=content_bytes),
             origins=origins,
             omissions=omissions,
+        )
+
+    def _select_evidence(
+        self,
+        *,
+        request: PrepareContextRequest,
+        memory_candidates: Sequence[PreparedMemoryCandidates],
+    ) -> PreparedContextBuild:
+        """Select query-relevant literal spans of the Memory candidates.
+
+        Evidence selection is opt-in and Memory-only, as the contract states: Code, Topic
+        Memory, Experience, and Profile stay out of the output, and the ordinary prepare path
+        is untouched when the flag is off. Every delivered span keeps its exact citation,
+        character range, and literal text, and the rendered envelope is measured end to end
+        against ``request.max_bytes``.
+
+        A fragment's address always names the Scope the candidate came from, never the current
+        Scope, so the same entry body recalled from two Scopes stays two distinct pieces of
+        evidence. A candidate set without a Scope is not addressable and is rejected instead of
+        being given a made-up identity.
+        """
+
+        candidates: list[tuple[MemoryEntryAddress, str]] = []
+        seen: set[tuple[str, str, str, str]] = set()
+        for group in memory_candidates:
+            if not group.scope_id:
+                raise PreparedContextInvariantError("memory-scope-missing")
+            for hit in group.hits:
+                if hit.memory_ref != group.memory_ref:
+                    raise PreparedContextInvariantError("memory-ref-mismatch")
+                if not hit.entry_id.strip() or not hit.entry_version_id.strip() or not hit.text.strip():
+                    continue
+                identity = (group.scope_id, hit.entry_id, hit.entry_version_id, hit.text)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                candidates.append((
+                    MemoryEntryAddress(
+                        memory=ArtifactAddress(scope_id=group.scope_id, artifact=hit.memory_ref),
+                        entry_id=hit.entry_id,
+                        entry_version_id=hit.entry_version_id,
+                    ),
+                    hit.text,
+                ))
+        if not candidates:
+            return PreparedContextBuild(context=self.empty(), origins=())
+        citations = [_fragment_citation(address) for address, _ in candidates]
+        texts = [text for _, text in candidates]
+        fixed_bytes = len(_evidence_envelope(()).encode("utf-8"))
+        spans = select_evidence(
+            query=request.query,
+            texts=texts,
+            citations=citations,
+            max_bytes=request.max_bytes,
+            fixed_bytes=fixed_bytes,
+            max_items=self.evidence_item_limit,
+        )
+        if not spans:
+            return PreparedContextBuild(context=self.empty(), origins=())
+        items = [_evidence_item(candidates[span.candidate][0], candidates[span.candidate][1], span) for span in spans]
+        content = _evidence_envelope(items)
+        content_bytes = len(content.encode("utf-8"))
+        if content_bytes > request.max_bytes:
+            raise PreparedContextInvariantError("output-budget")
+        return PreparedContextBuild(
+            context=PreparedContext(status="ready", content=content, content_bytes=content_bytes),
+            origins=tuple(candidates[span.candidate][0] for span in spans),
+            fragments=tuple(
+                MemoryFragment(
+                    address=candidates[span.candidate][0],
+                    start=span.start,
+                    end=span.end,
+                    text=candidates[span.candidate][1][span.start : span.end],
+                )
+                for span in spans
+            ),
         )
 
     def probe_budget(
@@ -277,6 +387,16 @@ class PreparedContextBuilder:
         counters because both go through :meth:`_select_entries`.
         """
 
+        if request.evidence_selection:
+            build = self._select_evidence(request=request, memory_candidates=memory_candidates)
+            content_bytes = build.context.content_bytes
+            return RecallBudgetView(
+                max_bytes=request.max_bytes,
+                delivered_items=len(build.origins),
+                truncated_items=0,
+                dropped_items=0,
+                unused_bytes=max(0, request.max_bytes - content_bytes),
+            )
         content, origins, omissions = self._select_entries(
             request=request,
             current_scope_id=current_scope_id,
@@ -683,6 +803,43 @@ def _interleave_groups(groups: Sequence[Sequence[_Item]]) -> tuple[_Item, ...]:
     for index in range(max((len(group) for group in groups), default=0)):
         ordered.extend(group[index] for group in groups if index < len(group))
     return tuple(ordered)
+
+
+def _fragment_citation(address: MemoryEntryAddress) -> dict[str, object]:
+    """Render the citation object for one evidence fragment.
+
+    The citation always carries the fragment's own Scope, even when it is the current Scope:
+    the same entry body in two Scopes is two different pieces of evidence, and a caller must
+    be able to tell them apart from the rendered item alone.
+    """
+
+    return {
+        "scope_id": address.memory.scope_id,
+        "memory_ref": address.memory.artifact.model_dump(mode="json"),
+        "entry_id": address.entry_id,
+        "entry_version_id": address.entry_version_id,
+    }
+
+
+def _evidence_item(address: MemoryEntryAddress, text: str, span: EvidenceSpan) -> dict[str, object]:
+    """Render one evidence item from its exact citation and literal character range."""
+
+    return evidence_item(_fragment_citation(address), text[span.start : span.end], span.start, span.end)
+
+
+def _evidence_envelope(items: Sequence[dict[str, object]]) -> str:
+    """Render the untrusted-history envelope that carries the selected fragments.
+
+    The trust policy and both envelope markers are part of every delivered output, so the
+    byte budget is charged for them; only the middle JSON differs between builds.
+    """
+
+    encoded = json.dumps(
+        {"trust": "untrusted_history", "items": list(items)},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{encoded}\n{_END_MARKER}"))
 
 
 def _render(entries: Sequence[_PreparedContextEntry]) -> str:
