@@ -786,6 +786,7 @@ def _artifact_processing_bindings(  # noqa: C901 - validate and assemble one reg
                 pending_provider=None
                 if family == "skill"
                 else SourceProcessingPendingProvider(contexts.database, binding, family),
+                count_threshold=getattr(config.runtime, f"{prefix}_source_count_threshold", None),
                 automatic_scope_filter=enabled_profile_scopes if family == "profile" else None,
             )
         )
