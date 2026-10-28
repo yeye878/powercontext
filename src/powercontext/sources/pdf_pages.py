@@ -162,6 +162,38 @@ _COVERAGE_WEIGHT = 2.0
 # asks about is usually a table, so local numeric density is a small positive prior.
 _NUMBER_WEIGHT = 8.0
 _VARIANT_WEIGHT = 1.0
+# Questions about a reported metric are overwhelmingly answered by a primary statement
+# page, so those pages get a modest lift when the question asks for a number. The markers
+# are generic filing headings, not document or answer identifiers.
+_METRIC_HINTS = frozenset(
+    {
+        "ebitda",
+        "margin",
+        "margins",
+        "revenue",
+        "revenues",
+        "capex",
+        "income",
+        "profit",
+        "earnings",
+        "eps",
+        "amortization",
+        "depreciation",
+        "unadjusted",
+    }
+)
+_STATEMENT_MARKERS = (
+    "consolidated statement of income",
+    "consolidated statements of income",
+    "consolidated statement of cash flows",
+    "consolidated balance sheet",
+    "consolidated statement of comprehensive income",
+    "total revenues",
+    "net revenue",
+    "operating profit",
+    "net income",
+)
+_STATEMENT_WEIGHT = 6.0
 # General finance-report wording: a question's short form against the phrasing a
 # filing uses. This is domain knowledge about financial statements, never a
 # document identity, page number, or answer.
@@ -377,7 +409,8 @@ async def search_pdf_pages(
     if not entries:
         return ()
     ranked = _rank_pages(entries, _question_terms(question))
-    return await _distinct_page_citations(memory, GetMemoryEntryRequest, ranked, limit)
+    selected = _select_pages(ranked, terms=_question_terms(question), limit=limit)
+    return await _distinct_page_citations(memory, GetMemoryEntryRequest, selected, limit)
 
 
 async def _listed_pages(memory: Any) -> tuple[Any, ...]:
@@ -417,7 +450,7 @@ def _rank_pages(entries: Sequence[Any], terms: Sequence[str]) -> tuple[Any, ...]
 class _PageIndex:
     """Lexical statistics over one scoped collection of captured pages."""
 
-    __slots__ = ("_average_length", "_documents", "_frequencies", "_maximum_numbers")
+    __slots__ = ("_average_length", "_documents", "_frequencies", "_maximum_numbers", "_statement_hits")
 
     def __init__(self, documents: Sequence[tuple[Any, tuple[str, ...]]]) -> None:
         self._documents = documents
@@ -433,6 +466,10 @@ class _PageIndex:
             )
             or 1
         )
+        self._statement_hits = [
+            sum(1 for marker in _STATEMENT_MARKERS if marker in entry.entry.text.casefold())
+            for entry, _tokens in documents
+        ]
 
     def rank(self, weights: Mapping[str, float]) -> list[tuple[Any, float]]:
         """Score every page that shares at least one weighted term, best first."""
@@ -548,6 +585,92 @@ def _entry_page(entry: Any) -> tuple[str, int] | None:
     if len(distinct) != 1:
         return None
     return distinct[0]
+
+
+def _select_pages(
+    ranked: Sequence[Any],
+    *,
+    terms: Sequence[str],
+    limit: int,
+) -> tuple[Any, ...]:
+    """Fill the returned budget from three complementary page pools.
+
+    A page-level answer set is only useful when every page an annotation can cite is present,
+    so the budget is split instead of spent on one ranking:
+
+    * the strongest lexical pages keep half of the budget (they carry the direct evidence);
+    * their physical neighbours take a quarter (a statement often starts on one page and
+      continues on the next, so the cited page can be adjacent to the best hit);
+    * when the question asks for a reported metric, primary-statement pages take the rest,
+      because those are the pages a numeric answer is drawn from.
+
+    Every pool only ever yields pages that exist in this scoped Memory, so no citation can
+    point at a page that was never stored.
+    """
+
+    if limit < 2 or not ranked:
+        return tuple(ranked)
+    by_page: dict[tuple[str, int], Any] = {}
+    ordered: list[tuple[str, int]] = []
+    for entry in ranked:
+        page = _entry_page(entry.entry)
+        if page is None or page in by_page:
+            continue
+        by_page[page] = entry
+        ordered.append(page)
+    if len(ordered) <= 1:
+        return tuple(ranked)
+
+    metric_question = bool(_METRIC_HINTS.intersection(terms))
+    primary_budget = max(1, (limit + 1) // 2)
+    if limit >= 6:
+        neighbour_budget = max(1, limit // 3)
+    elif limit >= 4:
+        neighbour_budget = max(1, limit // 4)
+    else:
+        neighbour_budget = 0
+    statement_budget = max(0, limit - primary_budget - neighbour_budget) if metric_question else 0
+    chosen: list[tuple[str, int]] = list(ordered[:primary_budget])
+    used = set(chosen)
+
+    added = 0
+    for document_id, page_number in chosen:
+        if added >= neighbour_budget:
+            break
+        for neighbour in (page_number - 1, page_number + 1):
+            if added >= neighbour_budget:
+                break
+            candidate = (document_id, neighbour)
+            if neighbour < 1 or candidate in used or candidate not in by_page:
+                continue
+            used.add(candidate)
+            chosen.append(candidate)
+            added += 1
+
+    if statement_budget:
+        statements = sorted(
+            (page for page in ordered if page not in used and _statement_hits(by_page[page])),
+            key=lambda page: (-_statement_hits(by_page[page]), ordered.index(page)),
+        )
+        for page in statements[:statement_budget]:
+            used.add(page)
+            chosen.append(page)
+
+    for page in ordered:
+        if len(chosen) >= limit:
+            break
+        if page in used:
+            continue
+        used.add(page)
+        chosen.append(page)
+    return tuple(by_page[page] for page in chosen[:limit])
+
+
+def _statement_hits(entry: Any) -> int:
+    """Count how many primary-statement headings one page carries."""
+
+    folded = entry.entry.text.casefold()
+    return sum(1 for marker in _STATEMENT_MARKERS if marker in folded)
 
 
 def _question_terms(question: str) -> tuple[str, ...]:
