@@ -41,6 +41,8 @@ from powercontext.limits import (
     MAX_EXTERNAL_SKILL_HOST_ID_LENGTH,
     MAX_EXTERNAL_SKILL_LOCATOR_LENGTH,
     MAX_EXTERNAL_SKILL_NAME_LENGTH,
+    MAX_LIFECYCLE_NODE_ID_LENGTH,
+    MAX_LIFECYCLE_REASON_LENGTH,
     MAX_SCOPE_BINDING_EXTERNAL_ID_LENGTH,
     MAX_SCOPE_BINDING_INTEGRATION_LENGTH,
     MAX_SCOPE_BINDING_KIND_LENGTH,
@@ -1180,6 +1182,54 @@ RECURRENCE_OBSERVATION_TABLE = Table(
 
 RECURRENCE_TABLES = (RECURRENCE_MATCH_TABLE, RECURRENCE_OBSERVATION_TABLE)
 
+# Source lifecycle evidence is authoritative registration state, not a rebuildable
+# projection: it records the exact caller-declared dependency graph and every
+# accepted event, so the propagation result can be reproduced after a restart.
+LIFECYCLE_NODES_TABLE = Table(
+    "pc_lifecycle_nodes",
+    SHARED_METADATA,
+    Column("scope_id", identity_string(MAX_SCOPE_ID_LENGTH), primary_key=True),
+    Column("node_id", identity_string(MAX_LIFECYCLE_NODE_ID_LENGTH), primary_key=True),
+    Column("node_kind", identity_string(16), nullable=False),
+    Column("revision", Integer, nullable=False),
+    Column("reference_family", identity_string(MAX_ARTIFACT_FAMILY_LENGTH)),
+    Column("reference_artifact_id", identity_string(MAX_ARTIFACT_ID_LENGTH)),
+    Column("reference_revision", Integer),
+    Column("source_type", identity_string(MAX_SOURCE_TYPE_LENGTH)),
+    Column("source_id", identity_string(MAX_SOURCE_ID_LENGTH)),
+    Column("entry_id", identity_string(MAX_MEMORY_ENTRY_ID_LENGTH)),
+    Column("entry_version_id", identity_string(MAX_MEMORY_ENTRY_ID_LENGTH)),
+    Column("parents", _canonical_payload_type(), nullable=False),
+    Column("policy", identity_string(8)),
+    Column("available", Boolean, nullable=False),
+    ForeignKeyConstraint(("scope_id",), ("pc_scopes.scope_id",), ondelete="CASCADE"),
+    CheckConstraint(
+        "node_kind IN ('source', 'memory', 'topic')",
+        name="ck_pc_lifecycle_nodes_kind",
+    ),
+    CheckConstraint(
+        "(node_kind = 'source' AND policy IS NULL) OR (node_kind <> 'source' AND policy IN ('all', 'any'))",
+        name="ck_pc_lifecycle_nodes_policy",
+    ),
+    CheckConstraint("revision > 0", name="ck_pc_lifecycle_nodes_revision_positive"),
+)
+
+LIFECYCLE_EVENTS_TABLE = Table(
+    "pc_lifecycle_events",
+    SHARED_METADATA,
+    Column("scope_id", identity_string(MAX_SCOPE_ID_LENGTH), primary_key=True),
+    Column("node_id", identity_string(MAX_LIFECYCLE_NODE_ID_LENGTH), primary_key=True),
+    Column("sequence", Integer, primary_key=True),
+    Column("revision", Integer, nullable=False),
+    Column("available", Boolean, nullable=False),
+    Column("reason", identity_string(MAX_LIFECYCLE_REASON_LENGTH), nullable=False),
+    ForeignKeyConstraint(("scope_id",), ("pc_scopes.scope_id",), ondelete="CASCADE"),
+    CheckConstraint("sequence > 0", name="ck_pc_lifecycle_events_sequence_positive"),
+    CheckConstraint("revision > 0", name="ck_pc_lifecycle_events_revision_positive"),
+)
+
+LIFECYCLE_TABLES = (LIFECYCLE_NODES_TABLE, LIFECYCLE_EVENTS_TABLE)
+
 BUILTIN_TABLES = (
     SCOPE_TABLES
     + SHARED_TABLES
@@ -1187,5 +1237,6 @@ BUILTIN_TABLES = (
     + MEMORY_TABLES
     + STATISTICS_TABLES
     + RECURRENCE_TABLES
+    + LIFECYCLE_TABLES
     + (ARTIFACT_TAGS_TABLE, DREAM_RUNS_TABLE, RECEIPT_MIGRATION_REVIEW_TABLE)
 )

@@ -277,7 +277,7 @@ so the previous database remains available for recovery:
 
    ```bash
    obloader <connection-options> -D <new-database> --csv \
-     --table 'pc_dream_runs,pc_scope_context_references,pc_scope_external_references,pc_scope_creation_requests,pc_scope_settings,pc_scope_bindings,pc_artifact_heads,pc_artifact_lineage_sources,pc_artifact_lineage_artifacts,pc_artifact_publications,pc_artifact_candidate_versions,pc_topic_memory_revision_publications,pc_memory_entry_versions' \
+     --table 'pc_dream_runs,pc_scope_context_references,pc_scope_external_references,pc_scope_creation_requests,pc_scope_settings,pc_scope_bindings,pc_artifact_heads,pc_artifact_lineage_sources,pc_artifact_lineage_artifacts,pc_artifact_publications,pc_artifact_candidate_versions,pc_topic_memory_revision_publications,pc_memory_entry_versions,pc_lifecycle_nodes,pc_lifecycle_events' \
      -f <export-directory>
    ```
 
