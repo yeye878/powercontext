@@ -269,3 +269,90 @@ def test_connector_declares_expected_identity(tmp_path) -> None:
     assert connector.name == "pi-session-history"
     assert connector.version == "1"
     assert connector.source_definitions == frozenset({"pi-event"})
+
+
+def _tree_records() -> list[dict]:
+    return [
+        {"type": "message", "id": "root", "parentId": None, "message": {"role": "user", "content": "Shared request"}},
+        {
+            "type": "message",
+            "id": "left",
+            "parentId": "root",
+            "message": {"role": "assistant", "content": "Left evidence"},
+        },
+        {"type": "model_change", "id": "control", "parentId": "root"},
+        {
+            "type": "message",
+            "id": "right",
+            "parentId": "control",
+            "message": {"role": "assistant", "content": "Right evidence"},
+        },
+    ]
+
+
+def _write_session(path, records, session_id: str = "tree") -> None:
+    header = {"type": "session", "version": 3, "id": session_id}
+    path.write_text("\n".join(json.dumps(record) for record in [header, *records]) + "\n", encoding="utf-8")
+
+
+@pytest.fixture
+def tree_scope(tmp_path):
+    """Return the archive path and a helper that runs the connector once."""
+
+    from selftest_support.runtime_fixture import run_connector_persisted
+
+    from powercontext.sources import ConnectorBinding
+
+    binding = ConnectorBinding(
+        scope_id="tree", binding_id="pi", connector_name="pi-session-history", connector_version="1"
+    )
+    path = tmp_path / "tree.jsonl"
+
+    async def run(leaf):
+        return await run_connector_persisted(
+            tmp_path, PI_EVENT_SOURCE_DEFINITION, PiSessionConnector(path, leaf), binding
+        )
+
+    return path, run
+
+
+def test_connector_detects_tampering_on_a_previously_imported_branch(tree_scope) -> None:
+    path, run = tree_scope
+    records = _tree_records()
+    _write_session(path, records)
+    asyncio.run(run("left"))
+
+    # Mutate the already-imported "left" node, then switch to the "right" leaf.
+    tampered = json.loads(json.dumps(records))
+    tampered[1]["message"]["content"] = "TAMPERED"
+    _write_session(path, tampered)
+
+    with pytest.raises(ValueError):
+        asyncio.run(run("right"))
+
+
+def test_connector_detects_an_imported_event_that_became_invisible(tree_scope) -> None:
+    path, run = tree_scope
+    records = _tree_records()
+    _write_session(path, records)
+    asyncio.run(run("left"))
+
+    # Blanking the body makes the event invisible to the branch parse, but the
+    # imported record is still expected to be intact.
+    blanked = json.loads(json.dumps(records))
+    blanked[1]["message"]["content"] = ""
+    _write_session(path, blanked)
+
+    with pytest.raises(ValueError):
+        asyncio.run(run("left"))
+
+
+def test_connector_detects_a_changed_session_identity(tree_scope) -> None:
+    path, run = tree_scope
+    _write_session(path, _tree_records())
+    asyncio.run(run("left"))
+
+    _write_session(path, _tree_records(), session_id="different-session")
+
+    with pytest.raises(ValueError):
+        asyncio.run(run("left"))

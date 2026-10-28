@@ -46,8 +46,6 @@ SOURCE_VERSION = "1"
 _JSON_OBJECT = TypeAdapter(dict[str, JsonValue])
 _UTF8_BOM = "\ufeff"
 _SUMMARY_TYPES = frozenset({"compaction", "branch_summary"})
-_CONTROL_TYPES = frozenset({"thinking_level_change", "model_change", "session"})
-_ROLE_SUMMARY = "role"
 
 
 class PiSessionInput(BaseModel):
@@ -85,14 +83,15 @@ class PiEventSource(Source):
 def parse_pi_session(value: PiSessionInput) -> tuple[PiEventInput, ...]:
     """Return the visible events of the selected branch, ordered root to leaf."""
 
-    records = _read_records(value.content)
-    if not records:
-        raise ValueError("Pi session archive must contain a session header")  # noqa: TRY003
-    session_id = _read_header(records[0])
-    nodes = _index_records(records[1:])
-    leaf_id = _resolve_leaf(nodes, value.leaf_id)
-    path = _ancestor_path(nodes, leaf_id)
-    return tuple(event for node in path if (event := _to_event(session_id, node)) is not None)
+    archive = _read_archive(value.content)
+    leaf_id = _resolve_leaf(archive.nodes, value.leaf_id)
+    path = _ancestor_path(archive.nodes, leaf_id)
+    events = tuple(event for node in path if (event := _to_event(archive.session_id, node)) is not None)
+    # Validate identity now so an unrepresentable event fails this archive
+    # instead of surfacing later during materialization.
+    for event in events:
+        pi_event_source_id(event.session_id, event.event_id)
+    return events
 
 
 def pi_event_source_id(session_id: str, event_id: str) -> str:
@@ -179,24 +178,21 @@ class PiSessionConnector:
         self.leaf_id = leaf_id
 
     async def run(self, session: ConnectorRunSession, /) -> ConnectorRunCompletion:
-        events = parse_pi_session(PiSessionInput(content=self.path.read_bytes(), leaf_id=self.leaf_id))
-        imported = _read_checkpoint(session.checkpoint)
-        pending = tuple(event for event in events if event.event_id not in imported)
-        for event in events:
-            previous = imported.get(event.event_id)
-            if previous is not None and previous != _event_digest(event):
-                raise ValueError(  # noqa: TRY003
-                    f"Pi event {event.event_id!r} changed after it was imported"
-                )
+        content = self.path.read_bytes()
+        archive = _read_archive(content)
+        events = parse_pi_session(PiSessionInput(content=content, leaf_id=self.leaf_id))
+        checkpoint = _read_checkpoint(session.checkpoint)
+        _verify_session_identity(checkpoint.session_id, archive.session_id)
+        _verify_imported_events(checkpoint.events, archive.nodes)
+        pending = tuple(event for event in events if event.event_id not in checkpoint.events)
         for event in pending:
             await session.submit(event.event_id, PI_EVENT_SOURCE_NAME, event)
-        updated = dict(imported)
+        updated = dict(checkpoint.events)
         for event in pending:
-            updated[event.event_id] = _event_digest(event)
-        session_id = events[0].session_id if events else ""
+            updated[event.event_id] = _node_digest(event.record)
         return ConnectorRunCompletion(
             status=ConnectorRunStatus.COMPLETE,
-            checkpoint=_write_checkpoint(session_id, updated),
+            checkpoint=_write_checkpoint(archive.session_id, updated),
         )
 
 
@@ -247,13 +243,15 @@ def _index_records(records: list[dict[str, JsonValue]]) -> dict[str, dict[str, J
             raise ValueError("Pi session records must declare a non-empty id")  # noqa: TRY003
         if event_id in nodes:
             raise ValueError(f"duplicate Pi session record id {event_id!r}")  # noqa: TRY003
-        nodes[event_id] = record
-    for event_id, record in nodes.items():
         parent_id = record.get("parentId")
+        # A parent must already exist, so the archive is topologically ordered.
+        # This rejects forward references and every cycle, including ones on
+        # branches that the selected leaf never reaches.
         if parent_id is not None and (not isinstance(parent_id, str) or parent_id not in nodes):
             raise ValueError(  # noqa: TRY003
                 f"Pi session record {event_id!r} references a missing parent {parent_id!r}"
             )
+        nodes[event_id] = record
     return nodes
 
 
@@ -333,7 +331,7 @@ def _render_message(message: JsonValue) -> tuple[str, str] | None:
 
 def _render_bash(role: str, message: dict[str, JsonValue]) -> tuple[str, str] | None:
     command = message.get("command")
-    if not isinstance(command, str):
+    if not isinstance(command, str) or not command.strip():
         return None
     output = message.get("output")
     if isinstance(output, str) and output:
@@ -343,7 +341,7 @@ def _render_bash(role: str, message: dict[str, JsonValue]) -> tuple[str, str] | 
 
 def _render_tool_result(role: str, message: dict[str, JsonValue]) -> tuple[str, str] | None:
     text = _render_content_text(message.get("content"))
-    if text is None:
+    if text is None or not text.strip():
         return None
     tool_name = _text_or_unknown(message.get("toolName"))
     tool_call_id = _text_or_unknown(message.get("toolCallId"))
@@ -385,18 +383,6 @@ def _render_blocks(content: JsonValue) -> str | None:
     return "\n".join(parts)
 
 
-def _render_tool_calls(content: JsonValue) -> list[str]:
-    if not isinstance(content, list):
-        return []
-    calls: list[str] = []
-    for block in content:
-        if isinstance(block, dict) and block.get("type") == "toolCall":
-            call = _render_tool_call(block)
-            if call:
-                calls.append(call)
-    return calls
-
-
 def _render_tool_call(block: dict[str, JsonValue]) -> str | None:
     name = block.get("name")
     call_id = block.get("id")
@@ -415,22 +401,83 @@ def _text_or_unknown(value: JsonValue) -> str:
     return value if isinstance(value, str) and value else "unknown"
 
 
-def _event_digest(event: PiEventInput) -> str:
-    encoded = json.dumps(event.model_dump(mode="json"), ensure_ascii=False, sort_keys=True)
+class _PiArchive:
+    """One parsed archive, retained so checkpoint verification can see every node."""
+
+    __slots__ = ("nodes", "session_id")
+
+    def __init__(self, session_id: str, nodes: dict[str, dict[str, JsonValue]]) -> None:
+        self.session_id = session_id
+        self.nodes = nodes
+
+
+def _read_archive(content: bytes) -> _PiArchive:
+    records = _read_records(content)
+    if not records:
+        raise ValueError("Pi session archive must contain a session header")  # noqa: TRY003
+    session_id = _read_header(records[0])
+    return _PiArchive(session_id, _index_records(records[1:]))
+
+
+class _PiCheckpoint:
+    """Imported-event digests plus the session they belong to."""
+
+    __slots__ = ("events", "session_id")
+
+    def __init__(self, session_id: str | None, events: dict[str, str]) -> None:
+        self.session_id = session_id
+        self.events = events
+
+
+def _verify_session_identity(recorded: str | None, session_id: str) -> None:
+    """Reject a checkpoint recorded for a different session archive."""
+
+    if recorded is not None and recorded != session_id:
+        raise ValueError(  # noqa: TRY003
+            f"Pi session archive changed from {recorded!r} to {session_id!r}"
+        )
+
+
+def _verify_imported_events(
+    imported: dict[str, str],
+    nodes: dict[str, dict[str, JsonValue]],
+) -> None:
+    """Reject a rewrite or removal of any imported event, on any branch.
+
+    Verification walks the whole record graph rather than the selected branch,
+    so switching leaves cannot hide tampering with earlier evidence, and an
+    event that became invisible still counts as changed.
+    """
+
+    for event_id, recorded in imported.items():
+        node = nodes.get(event_id)
+        if node is None:
+            raise ValueError(f"Pi event {event_id!r} was removed after it was imported")  # noqa: TRY003
+        if _node_digest(node) != recorded:
+            raise ValueError(f"Pi event {event_id!r} changed after it was imported")  # noqa: TRY003
+
+
+def _node_digest(record: dict[str, JsonValue]) -> str:
+    encoded = json.dumps(record, ensure_ascii=False, sort_keys=True)
     return f"sha256:{hashlib.sha256(encoded.encode()).hexdigest()}"
 
 
-def _read_checkpoint(checkpoint: JsonValue | None) -> dict[str, str]:
+def _read_checkpoint(checkpoint: JsonValue | None) -> _PiCheckpoint:
     if checkpoint is None:
-        return {}
+        return _PiCheckpoint(None, {})
     if not isinstance(checkpoint, dict):
         # Checkpoints are opaque JSON written by this module; a foreign value is
         # still reported through the same ValueError contract as bad archives.
         raise ValueError("Pi session checkpoint must be a JSON object")  # noqa: TRY003, TRY004
+    recorded_session = checkpoint.get("session_id")
+    session_id = recorded_session if isinstance(recorded_session, str) and recorded_session else None
     events = checkpoint.get("events")
     if not isinstance(events, dict):
-        return {}
-    return {str(event_id): str(digest) for event_id, digest in events.items()}
+        return _PiCheckpoint(session_id, {})
+    return _PiCheckpoint(
+        session_id,
+        {str(event_id): str(digest) for event_id, digest in events.items()},
+    )
 
 
 def _write_checkpoint(session_id: str, events: dict[str, str]) -> dict[str, JsonValue]:
