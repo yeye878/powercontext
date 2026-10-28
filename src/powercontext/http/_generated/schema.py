@@ -7964,6 +7964,62 @@ OPENAPI_SCHEMA: dict[str, JsonValue] = {
                         "preparation.",
                         "default": False,
                     },
+                    "evidence_selection": {
+                        "type": "boolean",
+                        "description": "Opt "
+                        "into "
+                        "query-driven "
+                        "selection "
+                        "of "
+                        "literal "
+                        "Memory "
+                        "fragments. "
+                        "Each "
+                        "item "
+                        "is "
+                        "one "
+                        "exact "
+                        "half-open "
+                        "character "
+                        "range "
+                        "of "
+                        "one "
+                        "Memory "
+                        "entry, "
+                        "cited "
+                        "by "
+                        "its "
+                        "own "
+                        "Scope, "
+                        "Memory "
+                        "revision, "
+                        "entry, "
+                        "and "
+                        "entry "
+                        "version. "
+                        "The "
+                        "byte "
+                        "budget "
+                        "covers "
+                        "the "
+                        "complete "
+                        "rendered "
+                        "output. "
+                        "Only "
+                        "Memory "
+                        "is "
+                        "assembled "
+                        "in "
+                        "this "
+                        "mode; "
+                        "omitting "
+                        "the "
+                        "field "
+                        "preserves "
+                        "ordinary "
+                        "prepare.",
+                        "default": False,
+                    },
                     "assembly": {"$ref": "#/components/schemas/ContextAssembly"},
                 },
                 "additionalProperties": False,
